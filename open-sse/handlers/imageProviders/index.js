@@ -18,6 +18,7 @@ import geminiWeb from "./gemini-web.js";
 import grokWeb from "./grok-web.js";
 import veoAiFreeWeb from "./veoaifree-web.js";
 import ucWeb from "./uc-web.js";
+import { getXcodeImageAdapter } from "./xcode.js";
 
 const ADAPTERS = {
   openai: createOpenAIAdapter("openai"),
@@ -48,8 +49,8 @@ const ADAPTERS = {
   "uc-web": ucWeb,
 };
 
-export function getImageAdapter(provider) {
-  return ADAPTERS[provider] || null;
+export function getImageAdapter(provider, model, credentials) {
+  return Object.hasOwn(ADAPTERS, provider) ? ADAPTERS[provider] : getXcodeImageAdapter(provider, model, credentials);
 }
 
 export function isImageProvider(provider) {

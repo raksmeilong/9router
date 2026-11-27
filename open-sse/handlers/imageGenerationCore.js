@@ -44,7 +44,7 @@ export async function handleImageGenerationCore({
     return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
   }
 
-  const adapter = getImageAdapter(provider);
+  const adapter = getImageAdapter(provider, model, credentials);
   if (!adapter) {
     return createErrorResult(
       HTTP_STATUS.BAD_REQUEST,
@@ -111,11 +111,15 @@ export async function handleImageGenerationCore({
   let providerResponse;
   try {
     providerResponse = await fetch(url, {
+      ...adapter.fetchOptions?.(),
       method: "POST",
       headers,
       body: serializeRequestBody(requestBody),
     });
   } catch (error) {
+    if (error.name === "TimeoutError") {
+      return createErrorResult(HTTP_STATUS.GATEWAY_TIMEOUT, "Image provider request timed out");
+    }
     const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
     log?.debug?.("IMAGE", `Fetch error: ${errMsg}`);
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
@@ -126,6 +130,7 @@ export async function handleImageGenerationCore({
   if (
     !executor?.noAuth &&
     !adapter.noAuth &&
+    !adapter.skipAuthRefresh &&
     (providerResponse.status === HTTP_STATUS.UNAUTHORIZED ||
       providerResponse.status === HTTP_STATUS.FORBIDDEN)
   ) {
@@ -145,6 +150,7 @@ export async function handleImageGenerationCore({
         const retryHeaders = adapter.buildHeaders(credentials, retryBody, model, body);
         const retryUrl = adapter.buildUrl(model, credentials, body);
         providerResponse = await fetch(retryUrl, {
+          ...adapter.fetchOptions?.(),
           method: "POST",
           headers: retryHeaders,
           body: serializeRequestBody(retryBody),
@@ -166,6 +172,7 @@ export async function handleImageGenerationCore({
       try {
         const fallbackHeaders = adapter.buildHeaders(credentials, fallbackBody, model, body);
         providerResponse = await fetch(url, {
+          ...adapter.fetchOptions?.(),
           method: "POST",
           headers: fallbackHeaders,
           body: serializeRequestBody(fallbackBody),
@@ -179,7 +186,9 @@ export async function handleImageGenerationCore({
   }
 
   if (!providerResponse.ok) {
-    const { statusCode, message } = await parseUpstreamError(providerResponse);
+    const { statusCode, message } = adapter.parseError
+      ? adapter.parseError(providerResponse)
+      : await parseUpstreamError(providerResponse);
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
     log?.debug?.("IMAGE", `Provider error: ${errMsg}`);
     return createErrorResult(statusCode, errMsg);
@@ -208,6 +217,9 @@ export async function handleImageGenerationCore({
       parsed = await providerResponse.json();
     }
   } catch (parseError) {
+    if (parseError.name === "TimeoutError") {
+      return createErrorResult(HTTP_STATUS.GATEWAY_TIMEOUT, "Image provider response timed out");
+    }
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, parseError.message || `Invalid response from ${provider}`);
   }
 

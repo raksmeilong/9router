@@ -87,6 +87,152 @@ describe("handleImageGenerationCore", () => {
     expect(responseBody.data[0].url).toBe("https://example.com/image.png");
   });
 
+  describe("configured XCode Flare image node", () => {
+    const modelInfo = {
+      provider: "openai-compatible-chat-xcode-fixture",
+      model: "gpt-image-2.6-flare",
+    };
+    const credentials = {
+      authType: "apikey",
+      apiKey: "xcode-fixture-key",
+      providerSpecificData: {
+        prefix: "xcode-image",
+        apiType: "chat",
+        baseUrl: "https://xcode.best/v1/",
+      },
+    };
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMQVDIGAACuAGcVHqFfAAAAAElFTkSuQmCC";
+    const reference = "data:image/png;base64," + png;
+
+    it("sends four product references and the style reference as multipart edits using the stored upstream key", async () => {
+      const payload = { created: 123, data: [{ b64_json: png }], usage: { input_tokens: 5, output_tokens: 7 } };
+      global.fetch.mockResolvedValueOnce(Response.json(payload));
+      const onUsage = vi.fn();
+
+      const result = await handleImageGenerationCore({
+        body: {
+          model: "xcode-image/gpt-image-2.6-flare",
+          prompt: "Edit these references",
+          images: Array.from({ length: 5 }, () => reference),
+        },
+        modelInfo,
+        credentials,
+        onUsage,
+      });
+
+      expect(result.success).toBe(true);
+      expect(await result.response.json()).toEqual(payload);
+      expect(global.fetch).toHaveBeenCalledOnce();
+      const [[url, request]] = global.fetch.mock.calls;
+      expect(url).toBe("https://xcode.best/v1/images/edits");
+      expect(request).toMatchObject({
+        method: "POST",
+        redirect: "error",
+        signal: expect.any(AbortSignal),
+        headers: { Authorization: "Bearer xcode-fixture-key" },
+      });
+      expect(request.headers).not.toHaveProperty("Content-Type");
+      expect(request.body).toBeInstanceOf(FormData);
+      expect(request.body.get("model")).toBe("gpt-image-2.6-flare");
+      expect(request.body.get("prompt")).toBe("Edit these references");
+      expect(request.body.get("response_format")).toBe("b64_json");
+      expect(request.body.get("output_format")).toBe("png");
+      const files = request.body.getAll("image[]");
+      expect(files.map(file => file.name)).toEqual([
+        "reference-1.png", "reference-2.png", "reference-3.png", "reference-4.png", "reference-5.png",
+      ]);
+      for (const file of files) {
+        expect(file.type).toBe("image/png");
+        expect(Buffer.from(await file.arrayBuffer()).toString("base64")).toBe(png);
+      }
+      expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ prompt_tokens: 5, completion_tokens: 7 }));
+    });
+
+    it("uses the documented single-image upload field for a single reference", async () => {
+      global.fetch.mockResolvedValueOnce(Response.json({ data: [{ b64_json: png }] }));
+      const result = await handleImageGenerationCore({
+        body: { prompt: "Edit this reference", images: [reference] },
+        modelInfo,
+        credentials,
+      });
+      expect(result.success).toBe(true);
+      const [[, request]] = global.fetch.mock.calls;
+      expect(request.body.get("image")).toBeInstanceOf(File);
+      expect(request.body.getAll("image[]")).toEqual([]);
+    });
+
+    it("uses the JSON generation route only for a request without references", async () => {
+      global.fetch.mockResolvedValueOnce(Response.json({ data: [{ b64_json: png }] }));
+      const result = await handleImageGenerationCore({ body: { prompt: "Generate a poster" }, modelInfo, credentials });
+
+      expect(result.success).toBe(true);
+      expect(global.fetch).toHaveBeenCalledOnce();
+      const [[url, request]] = global.fetch.mock.calls;
+      expect(url).toBe("https://xcode.best/v1/images/generations");
+      expect(request.headers["Content-Type"]).toBe("application/json");
+      expect(JSON.parse(request.body)).toEqual({
+        model: "gpt-image-2.6-flare",
+        prompt: "Generate a poster",
+        n: 1,
+        output_format: "png",
+        response_format: "b64_json",
+      });
+    });
+
+    it.each([
+      ["alternate origin", modelInfo, { ...credentials, providerSpecificData: { ...credentials.providerSpecificData, baseUrl: "https://other.example/v1" } }],
+      ["alternate node", modelInfo, { ...credentials, providerSpecificData: { ...credentials.providerSpecificData, prefix: "other-image" } }],
+      ["alternate API type", modelInfo, { ...credentials, providerSpecificData: { ...credentials.providerSpecificData, apiType: "responses" } }],
+      ["missing provider key", modelInfo, { ...credentials, apiKey: "" }],
+      ["alternate model", { ...modelInfo, model: "gpt-image-2.6-sunburst" }, credentials],
+    ])("does not use the XCode adapter with %s", async (_label, target, connection) => {
+      const result = await handleImageGenerationCore({
+        body: { prompt: "Generate" }, modelInfo: target, credentials: connection,
+      });
+      expect(result).toMatchObject({ success: false, status: 400 });
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects URL references without fetching them or generating without the reference", async () => {
+      const result = await handleImageGenerationCore({
+        body: { prompt: "Edit this reference", images: ["https://example.com/reference.png"] }, modelInfo, credentials,
+      });
+      expect(result).toMatchObject({ success: false, status: 400 });
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("preserves upstream quota status without sharing the upstream error body", async () => {
+      global.fetch.mockResolvedValueOnce(Response.json({ error: { message: "private upstream quota info" } }, { status: 403 }));
+      const result = await handleImageGenerationCore({
+        body: { prompt: "Edit this reference", images: [reference] }, modelInfo, credentials,
+      });
+
+      expect(result).toMatchObject({ success: false, status: 403 });
+      expect(result.error).toContain("Check the XCode credential and quota");
+      expect(await result.response.text()).not.toContain("private upstream quota info");
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it("surfaces a timeout without retrying", async () => {
+      global.fetch.mockRejectedValueOnce(new DOMException("The operation timed out", "TimeoutError"));
+      const result = await handleImageGenerationCore({
+        body: { prompt: "Edit this reference", images: [reference] }, modelInfo, credentials,
+      });
+
+      expect(result).toMatchObject({ success: false, status: 504, error: "Image provider request timed out" });
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+
+    it("fails cleanly when the upstream returns only a URL", async () => {
+      global.fetch.mockResolvedValueOnce(Response.json({ data: [{ url: "https://example.com/image.png" }] }));
+      const result = await handleImageGenerationCore({
+        body: { prompt: "Generate a poster" }, modelInfo, credentials,
+      });
+      expect(result).toMatchObject({ success: false, status: 502, error: "XCode returned no base64 image" });
+      expect(global.fetch).toHaveBeenCalledOnce();
+    });
+  });
+
   it("generates image with Gemini format", async () => {
     global.fetch.mockResolvedValueOnce(
       new Response(
